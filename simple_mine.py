@@ -8,6 +8,9 @@ import os
 import pydicom
 from tqdm import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import time
+from torchmetrics import PeakSignalNoiseRatio as PSNR
+from torchmetrics import StructuralSimilarityIndexMeasure as SSIM
 
 class SimpleResidualBlock(nn.Module):
     def __init__(self,in_channels,out_channels):
@@ -208,6 +211,13 @@ class SimpleDiffusion(nn.Module):
         self.alphas = 1. - self.betas #alpha = 1 - beta
         self.alphas_cumprod = torch.cumprod(self.alphas,dim=0)
 
+        # 计算DDIM所需的参数
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1 - self.alphas_cumprod)
+        self.log_one_minus_alphas_cumprod = torch.log(1 - self.alphas_cumprod)
+        self.sqrt_recip_alphas_cumprod = torch.sqrt(1 / self.alphas_cumprod)
+        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1 / self.alphas_cumprod - 1)
+
     def q_sample(self,x_0,t,noise=None):
         """
         x_0:原始图像[B,1,H,W]
@@ -312,6 +322,63 @@ class SimpleDiffusion(nn.Module):
             x_t = self.p_sample(x_t,t_tensor,cond)
         return x_t
 
+    @torch.no_grad()
+    def ddim_sample(self,cond,img_size,num_steps=50,eta=0.0):
+        """
+        DDIM采样方法
+        cond: 条件图像LDCT[B,1,H,W]
+        img_size: 输出图像形状[B,1,H,W]
+        num_steps: DDIM采样步数（远小于T）
+        eta: 控制随机性的参数，0为确定性采样
+        返回: 生成图像和采样时间
+        """
+        B,C,H,W = cond.shape
+        x = torch.randn(B,1,H,W).to(self.device) #初始噪声
+
+        # 选择DDIM采样的时间步（从T-1到0均匀选择num_steps个点）
+        times = torch.linspace(-1, self.T - 1, num_steps + 1).long().to(self.device)
+        times = list(reversed(times.tolist()))
+        time_pairs = list(zip(times[:-1], times[1:]))  # (t_prev, t)对
+
+        for i, (t_prev, t) in enumerate(tqdm(time_pairs, desc="DDIM Sampling")):
+            t_tensor = torch.full((B,), t, dtype=torch.long).to(self.device)
+            t_prev_tensor = torch.full((B,), t_prev, dtype=torch.long).to(self.device)
+
+            # 预测噪声
+            noise_pred = self.model(x, t_tensor, cond)
+
+            # 获取当前时间步的参数
+            alpha_cumprod_t = self._extract(self.alphas_cumprod, t_tensor, x.shape)
+            alpha_cumprod_t_prev = self._extract(self.alphas_cumprod, t_prev_tensor, x.shape)
+
+            # 计算DDIM均值和方差
+            x0_pred = (self.sqrt_recip_alphas_cumprod[t] * x -
+                       self.sqrt_recipm1_alphas_cumprod[t] * noise_pred)
+
+            # 确保预测的x0在合理范围内
+            x0_pred = torch.clamp(x0_pred, -1., 1.)
+
+            # 计算方向向量
+            sigma_t = eta * torch.sqrt(
+                (1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) *
+                (1 - alpha_cumprod_t / alpha_cumprod_t_prev)
+            )
+            variance = sigma_t ** 2
+
+            # 计算均值部分
+            mean = (torch.sqrt(alpha_cumprod_t_prev) * x0_pred +
+                    torch.sqrt(1 - alpha_cumprod_t_prev - variance) * (x - torch.sqrt(alpha_cumprod_t) * x0_pred) /
+                    torch.sqrt(1 - alpha_cumprod_t))
+
+            # 采样
+            if t_prev == -1:
+                x = mean
+            else:
+                noise = torch.randn_like(x)
+                x = mean + torch.sqrt(variance) * noise
+
+        return x
+
 class SimpleDataset(Dataset):
     def __init__(self, data_root, split="train"):
         """
@@ -364,8 +431,8 @@ class SimpleDataset(Dataset):
     def _collect_files_by_subdir(self, root_dir):
         """
         按子文件夹收集IMA文件，返回：{子文件夹名: 排序后的IMA文件路径列表}
-        :param root_dir: 根目录（如data/train/ldct）
-        :return: dict，例：{"L067": ["data/train/ldct/L067/001.IMA", "data/train/ldct/L067/002.IMA"]}
+        root_dir: 根目录（如data/train/ldct）
+        return: dict，例：{"L067": ["data/train/ldct/L067/001.IMA", "data/train/ldct/L067/002.IMA"]}
         """
         subdir_files = {}
         # 遍历根目录下的所有子文件夹（如L067）
@@ -490,6 +557,7 @@ def main():
     主函数,用于训练模型
     """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"使用设备：{device}")
 
     # 1.初始化模型
     unet = SimpleUNet(in_channels=2,base_channels=32,time_embedding_dim=64)
@@ -504,30 +572,78 @@ def main():
     # 4.保存模型
     torch.save(unet.state_dict(),'simple_diffusion_model.pth')
 
-    # 5.采样测试
+    # 5.采样测试及评估
     test_dataset = SimpleDataset(data_root='./data',split="test")
-    test_ldct = test_dataset[0]["ldct"].unsqueeze(0).to(device)
-    test_ndct = test_dataset[0]["ndct"]
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)  # 批量为1，便于逐样本评估
+    #test_ldct = test_dataset[0]["ldct"].unsqueeze(0).to(device)
+    #test_ndct = test_dataset[0]["ndct"]
+
+    psnr_metric = PSNR(data_range=1.0).to(device)
+    ssim_metric = SSIM(data_range=1.0,kernel_size=11).to(device)
+
     diffusion.eval()
+    total_psnr = 0.0
+    total_ssim = 0.0
+    total_time = 0.0
+    sample_count = 0
+
     with torch.no_grad():
-        generated = diffusion.sample(test_ldct,img_size=(1,512,512))
+        # 使用DDIM采样（50步，可根据需要调整）
+        for batch in tqdm(test_dataloader,desc="评估测试集"):
+            ldct = batch["ldct"].to(device) #[1,1,512,512]
+            ndct_gt = batch["ndct"].to(device) #真实NDCT图像
 
-    # 6.可视化结果
-    plt.figure(figsize=(18, 6))
-    plt.subplot(131)
-    plt.imshow(test_ldct[0, 0].cpu().numpy(), cmap='gray')
-    plt.title('Input LDCT')
-    plt.axis('off')
+            # 记录时间
+            start_time = time.time()
+            # 可选采样方式
+            generated_image = diffusion.ddim_sample(ldct,img_size=(1,512,512),num_steps=50)
+            end_time = time.time()
+            total_time += end_time - start_time #单次采样时间
 
-    plt.subplot(132)
-    plt.imshow(generated[0, 0].cpu().numpy(), cmap='gray')
-    plt.title('Generated NDCT')
-    plt.axis('off')
-    
-    plt.subplot(133)
-    plt.imshow(test_ndct[0].cpu().numpy(), cmap='gray')
-    plt.title('Ground Truth NDCT')
-    plt.axis('off')
+            # 生成图片后处理
+            generated_image = torch.clamp(generated_image,0.0,1.0)
+
+            # 计算PSNR与SSIM
+            psnr = psnr_metric(generated_image, ndct_gt)
+            ssim = ssim_metric(generated_image, ndct_gt)
+
+            # 累加指标
+            total_psnr += psnr.item()
+            total_ssim += ssim.item()
+            sample_count += 1
+
+            # 每10个样本可视化一个结果
+            if sample_count % 10 == 0:
+                plt.figure(figsize=(18, 6))
+                plt.subplot(131)
+                plt.imshow(ldct[0, 0].cpu().numpy(), cmap='gray')
+                plt.title('Input LDCT')
+                plt.axis('off')
+
+                plt.subplot(132)
+                plt.imshow(generated_image[0, 0].cpu().numpy(), cmap='gray')
+                plt.title(f'Generated (PSNR: {psnr.item():.2f}, SSIM: {ssim.item():.4f})')
+                plt.axis('off')
+
+                plt.subplot(133)
+                plt.imshow(ndct_gt[0, 0].cpu().numpy(), cmap='gray')
+                plt.title('Ground Truth NDCT')
+                plt.axis('off')
+
+                plt.tight_layout()
+                plt.savefig(f"eval_sample_{sample_count}.png", dpi=300)
+                plt.close()  # 关闭图像避免内存占用
+
+    # 计算平均指标
+    avg_psnr = total_psnr / sample_count
+    avg_ssim = total_ssim / sample_count
+    avg_time = total_time / sample_count
+
+    # 输出评估结果
+    print("\n测试集评估结果：")
+    print(f"平均PSNR: {avg_psnr:.2f} dB")
+    print(f"平均SSIM: {avg_ssim:.4f}")
+    print(f"单个样本平均生成时间: {avg_time:.4f} 秒")
 
 if __name__ == '__main__':
     main()
